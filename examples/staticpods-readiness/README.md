@@ -4,58 +4,51 @@ This example demonstrates how NRC can be used alongside [NPD (Node Problem Detec
 
 ## Deployment Steps
 
-1. Deploy a testing cluster if you haven't already. For this example we are using a Kubernetes 1.35 Kind cluster.
-   We need to also mount our problem daemon script and its respective config. On Kind this can be done using this config:
-
-   ```yaml
-   kind: Cluster
-   apiVersion: kind.x-k8s.io/v1alpha4
-   nodes:
-     # This is a 1 cluster node for testing purposes
-   - role: control-plane
-     extraMounts:
-      - hostPath: /path/to/check-staticpods-synced.sh
-        containerPath: /opt/check-staticpods-synced.sh
-      - hostPath: /path/to/staticpods-syncer.json
-        containerPath: /opt/staticpods-syncer.json
-      - hostPath: /path/to/staticPodsManifestsDir
-        containerPath: /etc/kubernetes/manifests
-   ```
-
-2. Install NRC and apply the node readiness rule:
+1. Deploy a testing cluster. For this example we use Kind with a pre-tainted worker node and test static pod:
 
    ```bash
-   kubectl apply -f nrr.yaml
+   kind create cluster --config examples/staticpods-readiness/kind-cluster-config.yaml
    ```
 
-3. Deploy NPD, either as a DaemonSet using the official Helm chart, or in standalone mode. Keep in mind that if you are going to go the Helm way, you need to modify the NPD image to include the binaries that your script depends on (in our case, we need `curl` and `kubectl`), or download them in your script (this is not recommended since you'll have to set a high timeout in the custom plugin monitor config, at least for the initial script run).
-
-   ### Standalone Mode
-
-   In this example, and since I have a 1-node Kind cluster, I will go the standalone way. Note that this is the default shipping method in GKE and AKS.
+2. Install NRC:
 
    ```bash
-   # Exec into your kind node
-   docker exec -it container_id bash
-
-   # Download NPD (change the arch if you are working on arm!)
-   curl -LO https://github.com/kubernetes/node-problem-detector/releases/download/v1.35.2/node-problem-detector-v1.35.2-linux_amd64.tar.gz
-   mkdir /opt/npd && tar -xf node-problem-detector-v1.35.2-linux_amd64.tar.gz -C /opt/npd && rm -f node-problem-detector-v1.35.2-linux_amd64.tar.gz
-
-   # Start NPD with the custom problem daemon
-   /opt/npd/bin/node-problem-detector \
-     --apiserver-override="https://127.0.0.1:6443?inClusterConfig=false&auth=/etc/kubernetes/admin.conf" \
-     --config.custom-plugin-monitor=/opt/staticpods-syncer.json
+   VERSION=v0.2.0
+   kubectl apply -f https://github.com/kubernetes-sigs/node-readiness-controller/releases/download/${VERSION}/crds.yaml
+   kubectl apply -f https://github.com/kubernetes-sigs/node-readiness-controller/releases/download/${VERSION}/install.yaml
    ```
 
-   ### Using Helm
-
-   Use the `values.yaml` file to override the default Helm values, and don't forget to add the required binaries to the NPD image (`curl`, `kubectl`).
+3. Deploy NPD as a DaemonSet with the static pods monitoring configuration:
 
    ```bash
-   helm repo add deliveryhero https://charts.deliveryhero.io/
-   helm repo update
-   helm install --generate-name deliveryhero/node-problem-detector -f values.yaml
+   ./examples/staticpods-readiness/setup-staticpods-monitoring.sh
    ```
 
-   > **Note:** For a more robust and reliable version of the shell script, you can check this [standalone binary](https://github.com/GGh41th/NPD-staticpods-syncer).
+   This deploys NPD with:
+   - Init container that downloads `kubectl`, `yq`, and `jq`
+   - Custom plugin that checks if static pods are mirrored
+   - RBAC permissions to read pods and nodes
+
+4. Apply the node readiness rule (deferred to observe behavior):
+
+   ```bash
+   kubectl apply -f examples/staticpods-readiness/npd-variant/staticpods-readiness-rule.yaml
+   ```
+
+5. Verify the setup:
+
+   ```bash
+   ./examples/staticpods-readiness/verify-setup.sh
+   ```
+
+## How It Works
+
+The NPD check script runs every 30s:
+- Finds manifests in `/etc/kubernetes/manifests`
+- Parses with `yq` (YAML) or `jq` (JSON) for robust extraction
+- Checks if mirror pod `{pod-name}-{node-name}` exists
+- Sets `StaticPodsMissing=False` if all mirrored
+
+NRC watches for `StaticPodsMissing=False` and removes the `readiness.k8s.io/StaticPodsMissing` taint.
+
+> **Note:** This example uses worker nodes for demonstration. In production, static pods typically exist only on control-plane nodes.
