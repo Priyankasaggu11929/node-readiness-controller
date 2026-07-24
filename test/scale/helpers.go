@@ -28,6 +28,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:staticcheck
@@ -287,5 +290,174 @@ func buildReportForPhase(phaseTitle string, phaseStart time.Time, phaseEnd time.
 		PhaseTitle:      phaseTitle,
 		DurationSeconds: phaseEnd.Sub(phaseStart).Seconds(),
 		Metrics:         formattedMetrics,
+	}
+}
+
+
+// writeJSONReport serializes all phase results into a structured JSON file in artifactsDir.
+// The format mirrors the perfdash dataItems schema used by Kubernetes perf tooling:
+//   - Histogram metrics (p50/p90/p99 trios) are grouped into a single dataItem each,
+//     with numeric data keys "Perc50", "Perc90", "Perc99".
+//   - Scalar metrics each become their own dataItem with a numeric "value" key.
+// This makes results machine-readable, comparable across runs, and compatible with perfdash.
+func writeJSONReport(artifactsDir string, results []queryResult) {
+	type dataItem struct {
+		Data   map[string]float64 `json:"data"`
+		Unit   string             `json:"unit"`
+		Labels map[string]string  `json:"labels"`
+	}
+	type report struct {
+		Version   string     `json:"version"`
+		DataItems []dataItem `json:"dataItems"`
+	}
+
+	// Build lookup: group -> unit
+	groupUnit := map[string]string{}
+	for _, q := range metricQueries {
+		if q.Group != "" {
+			groupUnit[q.Group] = q.Unit
+		}
+	}
+
+	var items []dataItem
+
+	for _, r := range results {
+		phaseLabel := r.PhaseTitle
+
+		// Histogram groups: merge Perc50/90/99 into one dataItem per group.
+		groupData := map[string]map[string]float64{}
+		for _, q := range metricQueries {
+			if q.Group == "" || q.Percentile == "" {
+				continue
+			}
+			rawVal, ok := r.Metrics[q.Key]
+			if !ok {
+				continue
+			}
+			f, err := parseMetricFloat(rawVal)
+			if err != nil {
+				continue
+			}
+			if groupData[q.Group] == nil {
+				groupData[q.Group] = map[string]float64{}
+			}
+			groupData[q.Group][q.Percentile] = f
+		}
+		// Emit in declaration order, deduplicated.
+		seenGroups := map[string]bool{}
+		for _, q := range metricQueries {
+			if q.Group == "" || q.Percentile == "" || seenGroups[q.Group] {
+				continue
+			}
+			seenGroups[q.Group] = true
+			data, ok := groupData[q.Group]
+			if !ok {
+				continue
+			}
+			items = append(items, dataItem{
+				Data: data,
+				Unit: groupUnit[q.Group],
+				Labels: map[string]string{"Metric": q.Group, "Phase": phaseLabel},
+			})
+		}
+
+		// Scalar metrics: one dataItem each with data: {"value": x}.
+		for _, q := range metricQueries {
+			if q.Group == "" || q.Percentile != "" {
+				continue
+			}
+			rawVal, ok := r.Metrics[q.Key]
+			if !ok {
+				continue
+			}
+			f, err := parseMetricFloat(rawVal)
+			if err != nil {
+				continue
+			}
+			items = append(items, dataItem{
+				Data:   map[string]float64{"value": f},
+				Unit:   q.Unit,
+				Labels: map[string]string{"Metric": q.Group, "Phase": phaseLabel},
+			})
+		}
+	}
+
+	out := report{Version: "v1", DataItems: items}
+	data, err := json.MarshalIndent(out, "", "  ")
+	Expect(err).NotTo(HaveOccurred(), "Failed to marshal JSON report")
+
+	reportPath := filepath.Join(artifactsDir, "scalability_report.json")
+	Expect(os.WriteFile(reportPath, data, 0600)).NotTo(HaveOccurred(), "Failed to write JSON report")
+	GinkgoWriter.Printf("JSON report written to %s\n", reportPath)
+}
+
+// parseMetricFloat extracts a float64 from a metric value string, stripping any unit suffix.
+// Examples: "2.5 s" -> 2.5, "67919872 bytes" -> 67919872, "0.195" -> 0.195
+// Returns an error for "N/A" and NaN values so callers can skip them cleanly.
+func parseMetricFloat(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if idx := strings.IndexByte(s, ' '); idx >= 0 {
+		s = s[:idx]
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("non-finite value: %s", s)
+	}
+	return f, nil
+}
+
+
+// capturePprofArtifacts fetches heap and goroutine pprof profiles from the controller's
+// pprof endpoint and writes them to artifactsDir. The controller must have been started
+// with --pprof-bind-address=:<port>.
+
+func capturePprofArtifacts(artifactsDir, host, port string) {
+	profiles := []struct {
+		name string
+		path string
+	}{
+		{"heap", "/debug/pprof/heap"},
+		{"goroutine", "/debug/pprof/goroutine?debug=2"},
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	baseURL := fmt.Sprintf("http://%s:%s", host, port)
+
+	for _, p := range profiles {
+		func() {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, baseURL+p.path, nil)
+			if err != nil {
+				GinkgoWriter.Printf("pprof: failed to build request for %s: %v\n", p.name, err)
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				GinkgoWriter.Printf("pprof: failed to fetch %s: %v\n", p.name, err)
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusOK {
+				GinkgoWriter.Printf("pprof: unexpected status %d for %s\n", resp.StatusCode, p.name)
+				return
+			}
+
+			outPath := filepath.Join(artifactsDir, fmt.Sprintf("pprof-%s.out", p.name))
+			f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600) // #nosec G304
+			if err != nil {
+				GinkgoWriter.Printf("pprof: failed to create output file %s: %v\n", outPath, err)
+				return
+			}
+			defer func() { _ = f.Close() }()
+
+			if _, err := io.Copy(f, resp.Body); err != nil {
+				GinkgoWriter.Printf("pprof: failed to write %s: %v\n", p.name, err)
+				return
+			}
+			GinkgoWriter.Printf("pprof %s written to %s\n", p.name, outPath)
+		}()
 	}
 }

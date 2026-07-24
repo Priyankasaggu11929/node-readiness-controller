@@ -54,6 +54,7 @@ var (
 	artifactsDir          string
 	controllerMetricsPort = "8080"
 	prometheusPort        = "9090"
+	pprofPort             = "8082"
 )
 
 //go:embed testdata/security-agent-rule.yaml
@@ -74,6 +75,9 @@ var _ = BeforeSuite(func() {
 	}
 	if port := os.Getenv("PROMETHEUS_PORT"); port != "" {
 		prometheusPort = port
+	}
+	if port := os.Getenv("PPROF_PORT"); port != "" {
+		pprofPort = port
 	}
 
 	By("Ensuring kwokctl binary is present")
@@ -188,6 +192,7 @@ var _ = BeforeSuite(func() {
 	By("Starting the node-readiness-controller manager daemon process")
 	args := []string{
 		fmt.Sprintf("--metrics-bind-address=:%s", controllerMetricsPort),
+		fmt.Sprintf("--pprof-bind-address=:%s", pprofPort),
 		"--metrics-secure=false",
 		"--leader-elect=false",
 		"--enable-webhook=false",
@@ -246,6 +251,12 @@ var _ = AfterSuite(func() {
 
 	err = tmpl.Execute(reportFile, reportData)
 	Expect(err).NotTo(HaveOccurred(), "Failed to template report data onto report file")
+
+	By("Writing JSON scalability report")
+	writeJSONReport(artifactsDir, queryResults)
+
+		By("Capturing pprof artifacts from controller")
+	capturePprofArtifacts(artifactsDir, "127.0.0.1", pprofPort)
 
 	if os.Getenv("SKIP_TEARDOWN") == "true" {
 		By("Skipping teardown. Controller background process, KWOK cluster and Prometheus kept alive.")
